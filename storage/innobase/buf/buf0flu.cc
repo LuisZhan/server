@@ -782,6 +782,96 @@ static void buf_release_freed_page(buf_page_t *bpage)
   mysql_mutex_unlock(&buf_pool.mutex);
 }
 
+struct buf_flush_request
+{
+  bool lru, skip_doublewrite;
+  fil_space_t *space;
+  buf_block_t *block;
+
+  /** Finish writing a page. */
+  void flush()
+  {
+    ut_ad(block->page.status ==
+          (skip_doublewrite ? buf_page_t::INIT_ON_FLUSH : buf_page_t::NORMAL));
+    byte *page= block->frame;
+    const size_t orig_size= block->physical_size();
+    size_t size= orig_size;
+
+    if (space->full_crc32())
+    {
+      /* innodb_checksum_algorithm=full_crc32 is not implemented for
+      ROW_FORMAT=COMPRESSED pages. */
+      ut_ad(!block->page.zip.data);
+      page= buf_page_encrypt(space, &block->page, page, &size);
+      buf_flush_init_for_writing(block, page, nullptr, true);
+    }
+    else
+    {
+      byte *frame= block->page.zip.data;
+      buf_flush_init_for_writing(block, page,
+                                 frame ? &block->page.zip : nullptr, false);
+      page= buf_page_encrypt(space, &block->page, frame ? frame : page, &size);
+    }
+
+    IORequest::Type type= lru ? IORequest::WRITE_LRU : IORequest::WRITE_ASYNC;
+#if defined HAVE_FALLOC_PUNCH_HOLE_AND_KEEP_SIZE || defined _WIN32
+    if (size != orig_size && space->punch_hole)
+      type= lru ? IORequest::PUNCH_LRU : IORequest::PUNCH;
+#else
+      DBUG_EXECUTE_IF("ignore_punch_hole",
+                      if (size != orig_size && space->punch_hole)
+                        type= lru ? IORequest::PUNCH_LRU : IORequest::PUNCH;);
+#endif
+
+    if (lru)
+      buf_pool.n_flush_LRU++;
+    else
+      buf_pool.n_flush_list++;
+    ut_ad(block->page.status ==
+          (skip_doublewrite ? buf_page_t::INIT_ON_FLUSH : buf_page_t::NORMAL));
+
+    if (!skip_doublewrite && space->use_doublewrite())
+      buf_dblwr.add_to_batch(space, IORequest(type, &block->page), size);
+    else
+      space->io(IORequest(type, &block->page), block->page.physical_offset(),
+                block->page.physical_size(), page, &block->page);
+  }
+};
+
+static constexpr int MAX_BUF_FLUSH_ASYNC_REQUESTS= 100;
+
+static tpool::cache<std::pair<tpool::task,buf_flush_request>>
+  request_cache(MAX_BUF_FLUSH_ASYNC_REQUESTS);
+
+static void buf_flush_page_task(void *param)
+{
+  auto req= static_cast<std::pair<tpool::task, buf_flush_request>*>(param);
+  req->second.flush();
+  request_cache.put(req);
+}
+
+static void wait_all_async_page_flush_requests()
+{
+  request_cache.wait();
+}
+
+/** Submit a flush request.
+@param lru               whether the page is to be evicted on write completion
+@param skip_doublewrite  whether the page is being initialized via redo log
+@param space             tablespace of the page
+@param block             buffer pool page */
+static void buf_flush_submit(bool lru, bool skip_doublewrite,
+                             fil_space_t *space, buf_block_t *block)
+{
+  if (auto req= request_cache.get(false))
+  {
+    *req= {{buf_flush_page_task, req}, {lru, skip_doublewrite, space, block}};
+    srv_thread_pool->submit_task(&req->first);
+  }
+  else
+    buf_flush_request{lru, skip_doublewrite, space, block}.flush();
+}
+
 /** Write a flushable page from buf_pool to a file.
 buf_pool.mutex must be held.
 @param bpage       buffer control block
@@ -865,60 +955,29 @@ static bool buf_flush_page(buf_page_t *bpage, bool lru, fil_space_t *space)
   {
     space->reacquire_for_io();
     ut_ad(status == buf_page_t::NORMAL || status == buf_page_t::INIT_ON_FLUSH);
-    size_t size, orig_size;
-    IORequest::Type type= lru ? IORequest::WRITE_LRU : IORequest::WRITE_ASYNC;
 
     if (UNIV_UNLIKELY(!rw_lock)) /* ROW_FORMAT=COMPRESSED */
     {
       ut_ad(!space->full_crc32());
       ut_ad(!space->is_compressed()); /* not page_compressed */
-      orig_size= size= bpage->zip_size();
+      size_t size= bpage->zip_size();
       buf_flush_update_zip_checksum(frame, size);
       frame= buf_page_encrypt(space, bpage, frame, &size);
       ut_ad(size == bpage->zip_size());
-    }
-    else
-    {
-      byte *page= block->frame;
-      orig_size= size= block->physical_size();
-
-      if (space->full_crc32())
-      {
-        /* innodb_checksum_algorithm=full_crc32 is not implemented for
-        ROW_FORMAT=COMPRESSED pages. */
-        ut_ad(!frame);
-	page= buf_page_encrypt(space, bpage, page, &size);
-	buf_flush_init_for_writing(block, page, nullptr, true);
-      }
+      if (lru)
+        buf_pool.n_flush_LRU++;
       else
-      {
-        buf_flush_init_for_writing(block, page, frame ? &bpage->zip : nullptr,
-                                   false);
-        page= buf_page_encrypt(space, bpage, frame ? frame : page, &size);
-      }
-
-#if defined HAVE_FALLOC_PUNCH_HOLE_AND_KEEP_SIZE || defined _WIN32
-      if (size != orig_size && space->punch_hole)
-        type= lru ? IORequest::PUNCH_LRU : IORequest::PUNCH;
-#else
-      DBUG_EXECUTE_IF("ignore_punch_hole",
-                      if (size != orig_size && space->punch_hole)
-                        type= lru ? IORequest::PUNCH_LRU : IORequest::PUNCH;);
-#endif
-      frame=page;
+        buf_pool.n_flush_list++;
+      const IORequest req(lru ? IORequest::WRITE_LRU : IORequest::WRITE_ASYNC,
+                          bpage);
+      ut_ad(status == bpage->status);
+      if (status != buf_page_t::NORMAL || !space->use_doublewrite())
+        space->io(req, bpage->physical_offset(), size, frame, bpage);
+      else
+        buf_dblwr.add_to_batch(space, req, size);
     }
-
-    ut_ad(status == bpage->status);
-
-    if (lru)
-      buf_pool.n_flush_LRU++;
     else
-      buf_pool.n_flush_list++;
-    if (status != buf_page_t::NORMAL || !space->use_doublewrite())
-      space->io(IORequest(type, bpage),
-                bpage->physical_offset(), size, frame, bpage);
-    else
-      buf_dblwr.add_to_batch(space, IORequest(type, bpage), size);
+      buf_flush_submit(lru, status == buf_page_t::INIT_ON_FLUSH, space, block);
   }
 
   /* Increment the I/O operation count used for selecting LRU policy. */
@@ -1467,11 +1526,12 @@ static bool buf_flush_do_batch(ulint max_n, lsn_t lsn, flush_counters_t *n)
   buf_pool.try_LRU_scan= true;
   buf_flush_page_count+= n->flushed;
 
-  mysql_mutex_unlock(&buf_pool.mutex);
-
   if (!n_flushing)
     mysql_cond_broadcast(cond);
 
+  mysql_mutex_unlock(&buf_pool.mutex);
+
+  wait_all_async_page_flush_requests();
   buf_dblwr.flush_buffered_writes();
 
   DBUG_PRINT("ib_buf", ("%s completed, " ULINTPF " pages",
